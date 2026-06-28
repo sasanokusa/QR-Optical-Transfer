@@ -1,0 +1,18 @@
+{
+  "name": "QR Optical Transfer",
+  "short_name": "QROPT",
+  "description": "One-way file transfer through QR codes and a camera.",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "background_color": "#f3f5f2",
+  "theme_color": "#1f2b24",
+  "icons": [
+    {
+      "src": "./icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}

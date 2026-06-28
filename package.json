@@ -1,0 +1,25 @@
+{
+  "name": "qr-optical-transfer",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host 0.0.0.0",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview --host 0.0.0.0",
+    "test:protocol": "node --experimental-strip-types scripts/protocol-smoke.mjs",
+    "test:qr": "node --experimental-strip-types scripts/qr-smoke.mjs",
+    "test:receiver": "node --experimental-strip-types scripts/receiver-smoke.mjs",
+    "test": "npm run build && npm run test:protocol && npm run test:qr && npm run test:receiver"
+  },
+  "dependencies": {
+    "fflate": "^0.8.3",
+    "jsqr": "^1.4.0",
+    "qrcode": "^1.5.4"
+  },
+  "devDependencies": {
+    "@types/qrcode": "^1.5.5",
+    "typescript": "^5.9.3",
+    "vite": "^7.2.4"
+  }
+}
