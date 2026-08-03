@@ -62,6 +62,7 @@ type ReceiverState = ReceiverTransferState & {
   lastQrAt: number | null;
   lastStatsAt: number;
   lastStatsFrame: number;
+  completingTransferId: string | null;
 };
 
 const senderState: SenderState = {
@@ -85,6 +86,7 @@ const receiverState: ReceiverState = {
   lastQrAt: null,
   lastStatsAt: performance.now(),
   lastStatsFrame: 0,
+  completingTransferId: null,
   ...createReceiverTransferState()
 };
 
@@ -735,7 +737,7 @@ async function tickTransfer(runId: number): Promise<void> {
     seqs.push(index);
   }
 
-  await drawQrCells(values);
+  await drawQrCells(values, runId);
 
   if (!senderState.isRunning || senderState.runId !== runId) {
     return;
@@ -782,23 +784,30 @@ function syncQrCanvases(count: number): HTMLCanvasElement[] {
   return Array.from(qrGrid.querySelectorAll("canvas"));
 }
 
-async function drawQrCells(values: string[]): Promise<void> {
+async function drawQrCells(values: string[], runId?: number): Promise<void> {
   const canvases = syncQrCanvases(values.length);
   const cols = gridCols(values.length);
   const cell = Math.max(240, Math.round(Number(qrSizeInput.value) / cols));
-  await Promise.all(
-    values.map((value, index) =>
-      QRCode.toCanvas(canvases[index], value, {
-        width: cell,
-        margin: 3,
-        errorCorrectionLevel: "M",
-        color: {
-          dark: "#050505",
-          light: "#ffffff"
-        }
-      })
-    )
-  );
+
+  // When runId is provided, check staleness BEFORE drawing. A stale draw must
+  // not touch the shared canvas at all — clearing after a draw would erase a
+  // newer tick (or manifest/hold view) that already painted the same canvas.
+  const draw = (value: string, index: number): Promise<void> => {
+    if (runId !== undefined && senderState.runId !== runId) {
+      return Promise.resolve();
+    }
+    return QRCode.toCanvas(canvases[index], value, {
+      width: cell,
+      margin: 3,
+      errorCorrectionLevel: "M",
+      color: {
+        dark: "#050505",
+        light: "#ffffff"
+      }
+    });
+  };
+
+  await Promise.all(values.map((value, index) => draw(value, index)));
 }
 
 function renderSender(): void {
@@ -969,10 +978,16 @@ async function scanTick(): Promise<void> {
 
   receiverState.scanFrames += 1;
 
-  if (receiverState.detector) {
-    await scanWithDetector(receiverState.detector);
-  } else {
-    scanWithJsQr();
+  // Wrap each scan path in try/catch so a single decoder exception does not
+  // kill the requestAnimationFrame loop (which would silently stop scanning).
+  try {
+    if (receiverState.detector) {
+      await scanWithDetector(receiverState.detector);
+    } else {
+      scanWithJsQr();
+    }
+  } catch {
+    // Continue scanning on the next frame; the decoder may recover.
   }
 
   renderScanStats();
@@ -1015,16 +1030,20 @@ function scanWithJsQr(): void {
     return;
   }
 
-  scanCanvas.width = cameraPreview.videoWidth;
-  scanCanvas.height = cameraPreview.videoHeight;
-  context.drawImage(cameraPreview, 0, 0, scanCanvas.width, scanCanvas.height);
-  const imageData = context.getImageData(0, 0, scanCanvas.width, scanCanvas.height);
-  const qr = jsQR(imageData.data, imageData.width, imageData.height);
+  try {
+    scanCanvas.width = cameraPreview.videoWidth;
+    scanCanvas.height = cameraPreview.videoHeight;
+    context.drawImage(cameraPreview, 0, 0, scanCanvas.width, scanCanvas.height);
+    const imageData = context.getImageData(0, 0, scanCanvas.width, scanCanvas.height);
+    const qr = jsQR(imageData.data, imageData.width, imageData.height);
 
-  if (qr?.data) {
-    receiverState.qrDetections += 1;
-    receiverState.lastQrAt = Date.now();
-    void handleQrData(qr.data);
+    if (qr?.data) {
+      receiverState.qrDetections += 1;
+      receiverState.lastQrAt = Date.now();
+      void handleQrData(qr.data);
+    }
+  } catch {
+    // A frame that fails to rasterize/decode must not stop the scan loop.
   }
 }
 
@@ -1064,6 +1083,9 @@ async function handleQrData(value: string): Promise<void> {
     receiverState.handled.clear();
     receiverState.handled.add(value);
     applyReceiverManifest(receiverState, packet);
+    // A new manifest invalidates any in-flight completion for the prior
+    // transfer. Clear the scoped lock so the new transfer can complete freely.
+    receiverState.completingTransferId = null;
     receiverStatus.textContent = "Manifest found";
     acceptTransfer.disabled = false;
     downloadFile.disabled = true;
@@ -1102,21 +1124,60 @@ async function handleQrData(value: string): Promise<void> {
 }
 
 async function completeTransfer(): Promise<void> {
+  // Guard against concurrent invocations (two scan frames can both observe the
+  // "missing count reached 0" condition while a decode is in flight). Only the
+  // first caller for the active transfer runs; the others drop out so the scan
+  // loop never re-enters. The lock is scoped to the active transferId so that a
+  // new manifest scanned mid-decode does not leave a stale lock that suppresses
+  // the new transfer's own completion.
   if (!receiverState.manifest) {
     return;
   }
-
-  receiverState.hashStatus = "checking";
-  renderReceiver();
-
-  const result = await completeReceiverTransfer(receiverState, receiverPassphrase.value);
-  if (receiverState.restoredBytes) {
-    restoredOutput.value = makePreview(receiverState.restoredBytes, receiverState.manifest.file.mime);
+  if (receiverState.completingTransferId === receiverState.manifest.transferId) {
+    return;
   }
-  downloadFile.disabled = !result.ok;
-  receiverStatus.textContent = result.ok ? "Complete" : result.message;
-  addLog(result.message);
-  renderReceiver();
+  receiverState.completingTransferId = receiverState.manifest.transferId;
+
+  // Capture the transfer we are completing BEFORE awaiting. The shared
+  // completingTransferId field can be reassigned by a newer transfer (B) while
+  // this one (A) is decoding; the captured ID lets us apply/clear only A's own
+  // result and never interfere with B's lock.
+  const completingId = receiverState.manifest.transferId;
+
+  // Snapshot the manifest and chunks so decode/hash work on this transfer's own
+  // data. If a new manifest (B) is accepted while A decodes, A's result must not
+  // be written onto B's state — we commit only if A is still the active transfer.
+  const manifest = receiverState.manifest;
+  const chunks = new Map(receiverState.chunks);
+
+  try {
+    receiverState.hashStatus = "checking";
+    renderReceiver();
+
+    const result = await completeReceiverTransfer(manifest, chunks, receiverPassphrase.value);
+
+    // A new manifest may have been scanned while decode/hash was in flight. Do
+    // not commit A's stale result onto the now-active transfer.
+    if (!receiverState.manifest || receiverState.manifest.transferId !== completingId) {
+      return;
+    }
+
+    if (result.bytes) {
+      receiverState.restoredBytes = result.bytes;
+      restoredOutput.value = makePreview(result.bytes, receiverState.manifest.file.mime);
+    }
+    receiverState.hashStatus = result.hashStatus;
+    downloadFile.disabled = !result.ok;
+    receiverStatus.textContent = result.ok ? "Complete" : result.message;
+    addLog(result.message);
+    renderReceiver();
+  } finally {
+    // Only clear the lock if it still belongs to this completion. If a newer
+    // transfer B took the lock while A was decoding, leave B's lock intact.
+    if (receiverState.completingTransferId === completingId) {
+      receiverState.completingTransferId = null;
+    }
+  }
 }
 
 function renderReceiver(): void {
@@ -1149,6 +1210,7 @@ function resetReceiver(): void {
   receiverState.lastQrAt = null;
   receiverState.lastStatsAt = performance.now();
   receiverState.lastStatsFrame = 0;
+  receiverState.completingTransferId = null;
   receiverScanRate.textContent = "0";
   receiverQrReads.textContent = "0 / 0";
   acceptTransfer.disabled = true;
