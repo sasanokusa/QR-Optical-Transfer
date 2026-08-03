@@ -789,8 +789,14 @@ async function drawQrCells(values: string[], runId?: number): Promise<void> {
   const cols = gridCols(values.length);
   const cell = Math.max(240, Math.round(Number(qrSizeInput.value) / cols));
 
-  const draw = (value: string, index: number): Promise<void> =>
-    QRCode.toCanvas(canvases[index], value, {
+  // When runId is provided, check staleness BEFORE drawing. A stale draw must
+  // not touch the shared canvas at all — clearing after a draw would erase a
+  // newer tick (or manifest/hold view) that already painted the same canvas.
+  const draw = (value: string, index: number): Promise<void> => {
+    if (runId !== undefined && senderState.runId !== runId) {
+      return Promise.resolve();
+    }
+    return QRCode.toCanvas(canvases[index], value, {
       width: cell,
       margin: 3,
       errorCorrectionLevel: "M",
@@ -799,20 +805,9 @@ async function drawQrCells(values: string[], runId?: number): Promise<void> {
         light: "#ffffff"
       }
     });
+  };
 
-  // When runId is provided, treat the drawing as stale if a newer run started
-  // while QR generation was in flight. A stale frame must not overwrite the
-  // canvas that a newer tick (or manifest/hold view) already painted.
-  await Promise.all(
-    values.map((value, index) =>
-      draw(value, index).then(() => {
-        if (runId !== undefined && senderState.runId !== runId) {
-          const ctx = canvases[index].getContext("2d");
-          ctx?.clearRect(0, 0, canvases[index].width, canvases[index].height);
-        }
-      })
-    )
-  );
+  await Promise.all(values.map((value, index) => draw(value, index)));
 }
 
 function renderSender(): void {
