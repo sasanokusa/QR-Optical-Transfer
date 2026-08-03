@@ -1143,6 +1143,12 @@ async function completeTransfer(): Promise<void> {
   }
   receiverState.completingTransferId = receiverState.manifest.transferId;
 
+  // Capture the transfer we are completing BEFORE awaiting. The shared
+  // completingTransferId field can be reassigned by a newer transfer (B) while
+  // this one (A) is decoding; the captured ID lets us apply/clear only A's own
+  // result and never interfere with B's lock.
+  const completingId = receiverState.manifest.transferId;
+
   try {
     receiverState.hashStatus = "checking";
     renderReceiver();
@@ -1150,11 +1156,8 @@ async function completeTransfer(): Promise<void> {
     const result = await completeReceiverTransfer(receiverState, receiverPassphrase.value);
 
     // A new manifest may have been scanned while decode/hash was in flight. Do
-    // not apply the stale result onto the now-active transfer.
-    if (
-      !receiverState.manifest ||
-      receiverState.manifest.transferId !== receiverState.completingTransferId
-    ) {
+    // not apply A's stale result onto the now-active transfer.
+    if (!receiverState.manifest || receiverState.manifest.transferId !== completingId) {
       return;
     }
 
@@ -1166,7 +1169,11 @@ async function completeTransfer(): Promise<void> {
     addLog(result.message);
     renderReceiver();
   } finally {
-    receiverState.completingTransferId = null;
+    // Only clear the lock if it still belongs to this completion. If a newer
+    // transfer B took the lock while A was decoding, leave B's lock intact.
+    if (receiverState.completingTransferId === completingId) {
+      receiverState.completingTransferId = null;
+    }
   }
 }
 
