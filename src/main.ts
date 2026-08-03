@@ -62,6 +62,7 @@ type ReceiverState = ReceiverTransferState & {
   lastQrAt: number | null;
   lastStatsAt: number;
   lastStatsFrame: number;
+  completing: boolean;
 };
 
 const senderState: SenderState = {
@@ -85,6 +86,7 @@ const receiverState: ReceiverState = {
   lastQrAt: null,
   lastStatsAt: performance.now(),
   lastStatsFrame: 0,
+  completing: false,
   ...createReceiverTransferState()
 };
 
@@ -735,7 +737,7 @@ async function tickTransfer(runId: number): Promise<void> {
     seqs.push(index);
   }
 
-  await drawQrCells(values);
+  await drawQrCells(values, runId);
 
   if (!senderState.isRunning || senderState.runId !== runId) {
     return;
@@ -782,19 +784,31 @@ function syncQrCanvases(count: number): HTMLCanvasElement[] {
   return Array.from(qrGrid.querySelectorAll("canvas"));
 }
 
-async function drawQrCells(values: string[]): Promise<void> {
+async function drawQrCells(values: string[], runId?: number): Promise<void> {
   const canvases = syncQrCanvases(values.length);
   const cols = gridCols(values.length);
   const cell = Math.max(240, Math.round(Number(qrSizeInput.value) / cols));
+
+  const draw = (value: string, index: number): Promise<void> =>
+    QRCode.toCanvas(canvases[index], value, {
+      width: cell,
+      margin: 3,
+      errorCorrectionLevel: "M",
+      color: {
+        dark: "#050505",
+        light: "#ffffff"
+      }
+    });
+
+  // When runId is provided, treat the drawing as stale if a newer run started
+  // while QR generation was in flight. A stale frame must not overwrite the
+  // canvas that a newer tick (or manifest/hold view) already painted.
   await Promise.all(
     values.map((value, index) =>
-      QRCode.toCanvas(canvases[index], value, {
-        width: cell,
-        margin: 3,
-        errorCorrectionLevel: "M",
-        color: {
-          dark: "#050505",
-          light: "#ffffff"
+      draw(value, index).then(() => {
+        if (runId !== undefined && senderState.runId !== runId) {
+          const ctx = canvases[index].getContext("2d");
+          ctx?.clearRect(0, 0, canvases[index].width, canvases[index].height);
         }
       })
     )
@@ -969,10 +983,16 @@ async function scanTick(): Promise<void> {
 
   receiverState.scanFrames += 1;
 
-  if (receiverState.detector) {
-    await scanWithDetector(receiverState.detector);
-  } else {
-    scanWithJsQr();
+  // Wrap each scan path in try/catch so a single decoder exception does not
+  // kill the requestAnimationFrame loop (which would silently stop scanning).
+  try {
+    if (receiverState.detector) {
+      await scanWithDetector(receiverState.detector);
+    } else {
+      scanWithJsQr();
+    }
+  } catch {
+    // Continue scanning on the next frame; the decoder may recover.
   }
 
   renderScanStats();
@@ -1015,16 +1035,20 @@ function scanWithJsQr(): void {
     return;
   }
 
-  scanCanvas.width = cameraPreview.videoWidth;
-  scanCanvas.height = cameraPreview.videoHeight;
-  context.drawImage(cameraPreview, 0, 0, scanCanvas.width, scanCanvas.height);
-  const imageData = context.getImageData(0, 0, scanCanvas.width, scanCanvas.height);
-  const qr = jsQR(imageData.data, imageData.width, imageData.height);
+  try {
+    scanCanvas.width = cameraPreview.videoWidth;
+    scanCanvas.height = cameraPreview.videoHeight;
+    context.drawImage(cameraPreview, 0, 0, scanCanvas.width, scanCanvas.height);
+    const imageData = context.getImageData(0, 0, scanCanvas.width, scanCanvas.height);
+    const qr = jsQR(imageData.data, imageData.width, imageData.height);
 
-  if (qr?.data) {
-    receiverState.qrDetections += 1;
-    receiverState.lastQrAt = Date.now();
-    void handleQrData(qr.data);
+    if (qr?.data) {
+      receiverState.qrDetections += 1;
+      receiverState.lastQrAt = Date.now();
+      void handleQrData(qr.data);
+    }
+  } catch {
+    // A frame that fails to rasterize/decode must not stop the scan loop.
   }
 }
 
@@ -1102,21 +1126,33 @@ async function handleQrData(value: string): Promise<void> {
 }
 
 async function completeTransfer(): Promise<void> {
-  if (!receiverState.manifest) {
+  // Guard against concurrent invocations (two scan frames can both observe the
+  // "missing count reached 0" condition while a decode is in flight). Only the
+  // first caller runs; the others drop out so the scan loop never re-enters.
+  if (receiverState.completing) {
     return;
   }
+  receiverState.completing = true;
 
-  receiverState.hashStatus = "checking";
-  renderReceiver();
+  try {
+    if (!receiverState.manifest) {
+      return;
+    }
 
-  const result = await completeReceiverTransfer(receiverState, receiverPassphrase.value);
-  if (receiverState.restoredBytes) {
-    restoredOutput.value = makePreview(receiverState.restoredBytes, receiverState.manifest.file.mime);
+    receiverState.hashStatus = "checking";
+    renderReceiver();
+
+    const result = await completeReceiverTransfer(receiverState, receiverPassphrase.value);
+    if (receiverState.restoredBytes) {
+      restoredOutput.value = makePreview(receiverState.restoredBytes, receiverState.manifest.file.mime);
+    }
+    downloadFile.disabled = !result.ok;
+    receiverStatus.textContent = result.ok ? "Complete" : result.message;
+    addLog(result.message);
+    renderReceiver();
+  } finally {
+    receiverState.completing = false;
   }
-  downloadFile.disabled = !result.ok;
-  receiverStatus.textContent = result.ok ? "Complete" : result.message;
-  addLog(result.message);
-  renderReceiver();
 }
 
 function renderReceiver(): void {
