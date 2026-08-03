@@ -62,7 +62,7 @@ type ReceiverState = ReceiverTransferState & {
   lastQrAt: number | null;
   lastStatsAt: number;
   lastStatsFrame: number;
-  completing: boolean;
+  completingTransferId: string | null;
 };
 
 const senderState: SenderState = {
@@ -86,7 +86,7 @@ const receiverState: ReceiverState = {
   lastQrAt: null,
   lastStatsAt: performance.now(),
   lastStatsFrame: 0,
-  completing: false,
+  completingTransferId: null,
   ...createReceiverTransferState()
 };
 
@@ -1088,6 +1088,9 @@ async function handleQrData(value: string): Promise<void> {
     receiverState.handled.clear();
     receiverState.handled.add(value);
     applyReceiverManifest(receiverState, packet);
+    // A new manifest invalidates any in-flight completion for the prior
+    // transfer. Clear the scoped lock so the new transfer can complete freely.
+    receiverState.completingTransferId = null;
     receiverStatus.textContent = "Manifest found";
     acceptTransfer.disabled = false;
     downloadFile.disabled = true;
@@ -1128,21 +1131,33 @@ async function handleQrData(value: string): Promise<void> {
 async function completeTransfer(): Promise<void> {
   // Guard against concurrent invocations (two scan frames can both observe the
   // "missing count reached 0" condition while a decode is in flight). Only the
-  // first caller runs; the others drop out so the scan loop never re-enters.
-  if (receiverState.completing) {
+  // first caller for the active transfer runs; the others drop out so the scan
+  // loop never re-enters. The lock is scoped to the active transferId so that a
+  // new manifest scanned mid-decode does not leave a stale lock that suppresses
+  // the new transfer's own completion.
+  if (!receiverState.manifest) {
     return;
   }
-  receiverState.completing = true;
+  if (receiverState.completingTransferId === receiverState.manifest.transferId) {
+    return;
+  }
+  receiverState.completingTransferId = receiverState.manifest.transferId;
 
   try {
-    if (!receiverState.manifest) {
-      return;
-    }
-
     receiverState.hashStatus = "checking";
     renderReceiver();
 
     const result = await completeReceiverTransfer(receiverState, receiverPassphrase.value);
+
+    // A new manifest may have been scanned while decode/hash was in flight. Do
+    // not apply the stale result onto the now-active transfer.
+    if (
+      !receiverState.manifest ||
+      receiverState.manifest.transferId !== receiverState.completingTransferId
+    ) {
+      return;
+    }
+
     if (receiverState.restoredBytes) {
       restoredOutput.value = makePreview(receiverState.restoredBytes, receiverState.manifest.file.mime);
     }
@@ -1151,7 +1166,7 @@ async function completeTransfer(): Promise<void> {
     addLog(result.message);
     renderReceiver();
   } finally {
-    receiverState.completing = false;
+    receiverState.completingTransferId = null;
   }
 }
 
@@ -1185,6 +1200,7 @@ function resetReceiver(): void {
   receiverState.lastQrAt = null;
   receiverState.lastStatsAt = performance.now();
   receiverState.lastStatsFrame = 0;
+  receiverState.completingTransferId = null;
   receiverScanRate.textContent = "0";
   receiverQrReads.textContent = "0 / 0";
   acceptTransfer.disabled = true;
