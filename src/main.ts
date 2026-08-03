@@ -1149,21 +1149,29 @@ async function completeTransfer(): Promise<void> {
   // result and never interfere with B's lock.
   const completingId = receiverState.manifest.transferId;
 
+  // Snapshot the manifest and chunks so decode/hash work on this transfer's own
+  // data. If a new manifest (B) is accepted while A decodes, A's result must not
+  // be written onto B's state — we commit only if A is still the active transfer.
+  const manifest = receiverState.manifest;
+  const chunks = new Map(receiverState.chunks);
+
   try {
     receiverState.hashStatus = "checking";
     renderReceiver();
 
-    const result = await completeReceiverTransfer(receiverState, receiverPassphrase.value);
+    const result = await completeReceiverTransfer(manifest, chunks, receiverPassphrase.value);
 
     // A new manifest may have been scanned while decode/hash was in flight. Do
-    // not apply A's stale result onto the now-active transfer.
+    // not commit A's stale result onto the now-active transfer.
     if (!receiverState.manifest || receiverState.manifest.transferId !== completingId) {
       return;
     }
 
-    if (receiverState.restoredBytes) {
-      restoredOutput.value = makePreview(receiverState.restoredBytes, receiverState.manifest.file.mime);
+    if (result.bytes) {
+      receiverState.restoredBytes = result.bytes;
+      restoredOutput.value = makePreview(result.bytes, receiverState.manifest.file.mime);
     }
+    receiverState.hashStatus = result.hashStatus;
     downloadFile.disabled = !result.ok;
     receiverStatus.textContent = result.ok ? "Complete" : result.message;
     addLog(result.message);

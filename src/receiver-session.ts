@@ -98,33 +98,37 @@ export function acceptReceiverChunk(
 }
 
 export async function completeReceiverTransfer(
-  state: ReceiverTransferState,
+  manifest: Manifest,
+  chunks: Map<number, string>,
   passphrase: string
-): Promise<{ ok: boolean; message: string }> {
-  if (!state.manifest) {
-    return { ok: false, message: "No manifest" };
-  }
-
-  state.hashStatus = "checking";
-  const payloadBytes = assembleBytes(state.chunks, state.manifest.payload.chunkCount);
+): Promise<{ ok: boolean; message: string; bytes: Uint8Array | null; hashStatus: ReceiverHashStatus }> {
+  const payloadBytes = assembleBytes(chunks, manifest.payload.chunkCount);
   let bytes: Uint8Array;
 
   try {
-    bytes = await decodePayload(payloadBytes, state.manifest, passphrase);
+    bytes = await decodePayload(payloadBytes, manifest, passphrase);
   } catch (error) {
-    state.hashStatus = "invalid";
-    return { ok: false, message: error instanceof Error ? error.message : "Decode failed" };
+    return {
+      ok: false,
+      message: error instanceof Error ? error.message : "Decode failed",
+      bytes: null,
+      hashStatus: "invalid"
+    };
   }
 
   const hash = await sha256HexBytes(bytes);
-  state.restoredBytes = bytes;
-  state.hashStatus = hash === state.manifest.hash.value ? "valid" : "invalid";
+  const hashStatus: ReceiverHashStatus = hash === manifest.hash.value ? "valid" : "invalid";
 
-  if (state.hashStatus !== "valid") {
-    return { ok: false, message: "Restored data did not match the manifest SHA-256." };
+  if (hashStatus !== "valid") {
+    return {
+      ok: false,
+      message: "Restored data did not match the manifest SHA-256.",
+      bytes,
+      hashStatus
+    };
   }
 
-  return { ok: true, message: "All chunks restored and SHA-256 verified." };
+  return { ok: true, message: "All chunks restored and SHA-256 verified.", bytes, hashStatus };
 }
 
 export function receiverTotalCount(state: ReceiverTransferState): number {

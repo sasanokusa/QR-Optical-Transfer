@@ -42,10 +42,10 @@ for (const chunk of hello.chunks.slice(1)) {
 
 assert.equal(receiverMissingCount(state), 0);
 assert.equal(receiverMissingRangeSummary(state), "none");
-const complete = await completeReceiverTransfer(state, "");
+const complete = await completeReceiverTransfer(hello.manifest, state.chunks, "");
 assert.equal(complete.ok, true);
-assert.equal(state.hashStatus, "valid");
-assert.equal(new TextDecoder().decode(state.restoredBytes), new TextDecoder().decode(hello.bytes));
+assert.equal(complete.hashStatus, "valid");
+assert.equal(new TextDecoder().decode(complete.bytes), new TextDecoder().decode(hello.bytes));
 
 const encrypted = await buildByteTransfer({
   name: "secret.txt",
@@ -64,15 +64,16 @@ assert.equal(acceptReceiverTransfer(encryptedState, "secret phrase").ok, true);
 for (const chunk of encrypted.chunks) {
   acceptReceiverChunk(encryptedState, chunk);
 }
-assert.equal((await completeReceiverTransfer(encryptedState, "wrong phrase")).ok, false);
-assert.equal(encryptedState.hashStatus, "invalid");
+assert.equal((await completeReceiverTransfer(encrypted.manifest, encryptedState.chunks, "wrong phrase")).ok, false);
+assert.equal((await completeReceiverTransfer(encrypted.manifest, encryptedState.chunks, "wrong phrase")).hashStatus, "invalid");
 
 applyReceiverManifest(encryptedState, encrypted.manifest);
 acceptReceiverTransfer(encryptedState, "secret phrase");
 for (const chunk of encrypted.chunks) {
   acceptReceiverChunk(encryptedState, chunk);
 }
-assert.equal((await completeReceiverTransfer(encryptedState, "secret phrase")).ok, true);
-assert.equal(new TextDecoder().decode(encryptedState.restoredBytes), "secret");
+const encryptedComplete = await completeReceiverTransfer(encrypted.manifest, encryptedState.chunks, "secret phrase");
+assert.equal(encryptedComplete.ok, true);
+assert.equal(new TextDecoder().decode(encryptedComplete.bytes), "secret");
 
 console.log("receiver-smoke ok");
