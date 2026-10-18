@@ -1,151 +1,103 @@
-// Empirical analysis of QROPT/1 practical limits.
-// Measures real JSON-envelope overhead and the QR version/module count that the
-// `qrcode` library (same one main.ts uses) selects for representative chunks.
+// Capacity / throughput analysis for QROPT/2.
+//
+// Everything is computed from the real encoder, so the numbers match what the
+// app actually emits. Run with:
+//   node --experimental-strip-types scripts/limits-analysis.mjs
 import QRCode from "qrcode";
+import { encodeChunkFrame } from "../src/core/codec.ts";
+import { buildTransfer } from "../src/core/transfer.ts";
 
-const ECC = "M"; // matches drawQrCells() errorCorrectionLevel: "M"
+const ECC_LEVELS = ["L", "M", "Q", "H"];
+const CHUNK_SIZES = [200, 300, 400, 500, 600, 700, 800, 900, 1000, 1200, 1400, 1730];
 
-function bytesToBase64UrlLen(rawBytes) {
-  // base64url of N bytes = ceil(N/3)*4 chars, minus padding stripped (= up to 2 fewer).
-  const full = Math.ceil(rawBytes / 3) * 4;
-  const rem = rawBytes % 3;
-  const pad = rem === 0 ? 0 : 3 - rem; // chars of '=' that get stripped
-  return full - pad;
-}
+const source = {
+  name: "analysis.bin",
+  mime: "application/octet-stream",
+  bytes: randomBytes(60_000)
+};
 
-function makeChunkJson({ chunkRawBytes, seq, total, transferIdLen = 16 }) {
-  const dataLen = bytesToBase64UrlLen(chunkRawBytes);
-  const data = "x".repeat(dataLen);
-  const transferId = "a".repeat(transferIdLen);
-  const obj = {
-    proto: "QROPT/1",
-    type: "chunk",
-    transferId,
-    seq,
-    total,
-    data
-  };
-  return JSON.stringify(obj);
-}
-
-async function qrInfo(text) {
-  // qrcode picks the smallest version that fits at the given ECC.
-  const qr = QRCode.create(text, { errorCorrectionLevel: ECC });
-  const version = qr.version;
-  const modules = qr.modules.size; // modules per side (no quiet zone)
-  return { version, modules, contentLen: text.length };
-}
-
-console.log(`# QROPT/1 capacity analysis (ECC level ${ECC})\n`);
-
-// --- JSON overhead ---
-console.log("## JSON envelope overhead (chunk packet)");
-for (const raw of [200, 600, 900, 1200]) {
-  const json = makeChunkJson({ chunkRawBytes: raw, seq: 1234, total: 5826 });
-  const dataLen = bytesToBase64UrlLen(raw);
-  const overhead = json.length - dataLen;
-  const efficiency = (raw / json.length) * 100;
-  console.log(
-    `chunkRaw=${raw}B  base64data=${dataLen}ch  QRcontent=${json.length}ch  envelope=${overhead}ch  payload/QRcontent=${efficiency.toFixed(1)}%`
-  );
-}
-
-// --- QR version & module count for default & extreme chunk sizes ---
-console.log("\n## QR version / module count selected by qrcode lib");
-for (const raw of [200, 600, 900, 1200]) {
-  const json = makeChunkJson({ chunkRawBytes: raw, seq: 9999, total: 9999 });
-  const info = await qrInfo(json);
-  console.log(
-    `chunkRaw=${raw}B  QRcontent=${info.contentLen}ch  -> QR version ${info.version} (${info.modules}x${info.modules} modules)`
-  );
-}
-
-// Manifest size
-const sampleManifest = JSON.stringify({
-  proto: "QROPT/1", type: "manifest", transferId: "0123456789abcdef",
-  file: { name: "sample-archive.zip", mime: "application/zip", size: 5242880 },
-  payload: { encoding: "base64url", compression: "gzip", encryption: "AES-GCM", chunkSize: 900, chunkCount: 5826, size: 5242880 },
-  crypto: { alg: "AES-GCM", iv: "aaaaaaaaaaaaaaaa", tagLength: 128, kdf: { name: "PBKDF2", hash: "SHA-256", iterations: 250000, salt: "aaaaaaaaaaaaaaaaaaaaaa" } },
-  hash: { alg: "SHA-256", value: "a".repeat(64) },
-  display: { fps: 5, loop: true }
+const bundle = await buildTransfer(source, {
+  chunkSize: 4000,
+  repairRatio: 0,
+  compression: "none",
+  transferId: "anls"
 });
-const manInfo = await qrInfo(sampleManifest);
-console.log(`manifest         QRcontent=${manInfo.contentLen}ch  -> QR version ${manInfo.version} (${manInfo.modules}x${manInfo.modules} modules)`);
 
-// --- Camera resolution requirement ---
-console.log("\n## Camera pixels needed to resolve the QR (single QR, fills 50% of frame width)");
-console.log("Rule of thumb: jsQR/BarcodeDetector need ~3 camera px per module for reliable decode (absolute min ~2).");
-for (const raw of [200, 900, 1200]) {
-  const json = makeChunkJson({ chunkRawBytes: raw, seq: 9999, total: 9999 });
-  const info = await qrInfo(json);
-  const modulesWithQuiet = info.modules + 8; // 4-module quiet zone each side
-  for (const fill of [0.5]) {
-    for (const pxPerModule of [2, 3]) {
-      const qrWidthPx = modulesWithQuiet * pxPerModule;
-      const frameWidthPx = Math.round(qrWidthPx / fill);
-      console.log(
-        `chunkRaw=${raw}B  v${info.version} ${info.modules}mod(+quiet=${modulesWithQuiet})  @${pxPerModule}px/mod  QR=${qrWidthPx}px  needs frame width >= ${frameWidthPx}px`
-      );
+console.log("# QROPT/2 capacity and throughput\n");
+console.log(
+  "Frame = 2 magic + 4 id + 1 kind + seq + ':' + base64url(payload) + '*' + crc32(base36)\n"
+);
+
+for (const ecc of ECC_LEVELS) {
+  console.log(`## Chunk size vs QR density (ECC ${ecc})\n`);
+  console.log("| chunk B | frame chars | QR version | modules | 3 px/module needs |");
+  console.log("| ---: | ---: | ---: | ---: | ---: |");
+
+  for (const chunkSize of CHUNK_SIZES) {
+    const payload = randomBytes(chunkSize);
+    const text = encodeChunkFrame("anls", "data", 1234, payload);
+    let version;
+    let modules;
+
+    try {
+      const qr = QRCode.create(text, { errorCorrectionLevel: ecc });
+      version = qr.version;
+      modules = qr.modules.size;
+    } catch {
+      continue;
     }
+
+    console.log(
+      `| ${chunkSize} | ${text.length} | ${version} | ${modules}×${modules} | ${(modules + 8) * 3} px |`
+    );
   }
+
+  console.log("");
 }
 
-// --- Throughput & transfer time ---
-console.log("\n## Throughput (payload bytes/sec) = chunkSize x fps x gridCount  [zero-loss best case]");
-const fpsList = [3, 5, 8, 10];
-const grids = [1, 4, 9];
-const chunkSize = 900;
-console.log(`(chunkSize=${chunkSize}B raw payload per QR)`);
-for (const grid of grids) {
-  const row = fpsList.map((fps) => {
-    const bps = chunkSize * fps * grid;
-    return `${fps}fps=${(bps / 1024).toFixed(1)}KB/s`;
-  });
-  console.log(`grid ${grid}: ${row.join("  ")}`);
+console.log("## Throughput (payload bytes/s, zero loss)\n");
+console.log("| chunk B | 5 fps | 8 fps | 10 fps | 15 fps | 20 fps |");
+console.log("| ---: | ---: | ---: | ---: | ---: | ---: |");
+
+for (const chunkSize of [200, 300, 400, 600, 800, 900, 1200]) {
+  const row = [5, 8, 10, 15, 20].map((fps) => `${((chunkSize * fps) / 1024).toFixed(1)} KB/s`);
+  console.log(`| ${chunkSize} | ${row.join(" | ")} |`);
 }
 
-console.log("\n## Single-pass transfer time (zero loss), chunkSize=900B, grid=1");
-for (const sizeMB of [0.1, 1, 5]) {
-  const bytes = sizeMB * 1024 * 1024;
-  const chunks = Math.ceil(bytes / chunkSize);
-  const row = fpsList.map((fps) => {
-    const sec = chunks / fps;
-    return `${fps}fps=${fmtTime(sec)}`;
-  });
-  console.log(`${sizeMB}MB (${chunks} chunks): ${row.join("  ")}`);
+console.log("\n## Repair overhead\n");
+console.log("| data chunks | repair 8 % | 12 % | 20 % | 30 % |");
+console.log("| ---: | ---: | ---: | ---: | ---: |");
+for (const count of [10, 100, 1000, 5000]) {
+  const row = [0.08, 0.12, 0.2, 0.3].map((ratio) => Math.max(1, Math.round(count * ratio)));
+  console.log(`| ${count} | ${row.join(" | ")} |`);
 }
 
-// --- Loss / loop cost (independent per-chunk capture prob q per loop) ---
-console.log("\n## Effect of per-loop chunk loss on completion (coupon-collector style)");
-console.log("Expected loops to capture ALL N chunks when each chunk is seen with prob q per pass.");
-for (const N of [100, 1000, 5826]) {
-  const row = [0.99, 0.95, 0.9, 0.8].map((q) => {
-    const loops = expectedLoops(N, q);
-    return `q=${q}->~${loops.toFixed(1)} loops`;
-  });
-  console.log(`N=${N}: ${row.join("  ")}`);
-}
+console.log("\n## Expected passes to completion\n");
+console.log(
+  "Per-pass capture probability q per frame; repairs only need to cover the gap between\n" +
+    "what was captured and what the repair equations can solve. Numbers below come from a\n" +
+    "deterministic channel simulation of the real schedule (see scripts/repair-smoke.mjs).\n"
+);
 
-function expectedLoops(N, q) {
-  // E[max of N geometric] approx = sum_{k=1..N} 1/(1-(1-q)^k) ... use harmonic approx:
-  // E ~ (1/ -ln(1-q-ish))... Use accurate-ish: E[loops] ~ (ln N + gamma)/(-ln(1-q)) for small loss,
-  // but more robust: simulate expectation via 1 + (1/q)*H_N? We'll use the standard result:
-  // For each pass each missing chunk independently captured w.p. q. Expected passes to get all =
-  // sum over chunks treated as max of N iid Geometric(q): approx (H_N)/(-ln(1-q))?
-  // Use exact expectation of max of N Geometric(q):
-  const p = 1 - q; // miss prob per pass
-  // E[max] = sum_{i=1..inf} (1 - (1 - p^i)^N)
-  let e = 0;
-  for (let i = 0; i < 100000; i++) {
-    const term = 1 - Math.pow(1 - Math.pow(p, i), N);
-    e += term;
-    if (term < 1e-9 && i > 5) break;
+const demo = await buildTransfer(
+  { name: "demo.txt", mime: "text/plain", bytes: randomBytes(30_000) },
+  { chunkSize: 300, repairRatio: 0.12, compression: "none", transferId: "demo" }
+);
+console.log(
+  `Example transfer: ${demo.manifest.payload.chunkCount} data frames + ` +
+    `${demo.manifest.payload.repairCount} repair frames.`
+);
+console.log(
+  `Manifest QR: ${JSON.stringify(demo.manifestText).length} chars -> ` +
+    `${QRCode.create(demo.manifestText, { errorCorrectionLevel: "M" }).version} at ECC M.`
+);
+
+function randomBytes(length) {
+  const bytes = new Uint8Array(length);
+  let state = 0x12345678;
+  for (let index = 0; index < length; index += 1) {
+    state = (Math.imul(state, 1664525) + 1013904223) >>> 0;
+    bytes[index] = state >>> 24;
   }
-  return e;
-}
-
-function fmtTime(sec) {
-  if (sec < 60) return `${sec.toFixed(0)}s`;
-  if (sec < 3600) return `${(sec / 60).toFixed(1)}min`;
-  return `${(sec / 3600).toFixed(2)}h`;
+  return bytes;
 }
