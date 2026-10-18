@@ -1,79 +1,182 @@
 import assert from "node:assert/strict";
+import { utf8Encoder } from "../src/core/bytes.ts";
+import { encodeChunkFrame } from "../src/core/codec.ts";
+import { buildTransfer } from "../src/core/transfer.ts";
 import {
-  acceptReceiverChunk,
-  acceptReceiverTransfer,
-  applyReceiverManifest,
-  completeReceiverTransfer,
-  createReceiverTransferState,
-  receiverMissingRangeSummary,
-  receiverMissingCount,
-  receiverTotalCount
-} from "../src/receiver-session.ts";
-import { buildByteTransfer, buildHelloWorldTransfer } from "../src/protocol.ts";
+  acceptTransfer,
+  applyManifest,
+  createReceiverSession,
+  discardPendingManifest,
+  getProgress,
+  ingestText,
+  missingRanges,
+  resetReceiverSession,
+  restoreTransfer,
+  switchToPendingManifest,
+  trySolve
+} from "../src/core/receiver.ts";
 
-const hello = await buildHelloWorldTransfer({ chunkCount: 100, fps: 5, loop: true });
-const state = createReceiverTransferState();
+const bytes = utf8Encoder.encode("receiver session smoke\n".repeat(40));
+const transfer = await buildTransfer(
+  { name: "session.txt", mime: "text/plain", bytes },
+  { chunkSize: 64, repairRatio: 0.4, compression: "none", transferId: "smk1" }
+);
+assert.ok(transfer.manifest.payload.repairCount >= 5);
+const dataFrames = transfer.data.map((chunk, seq) =>
+  encodeChunkFrame(transfer.manifest.transferId, "data", seq, chunk)
+);
+const repairFrames = transfer.repairs.map((chunk, seq) =>
+  encodeChunkFrame(transfer.manifest.transferId, "repair", seq, chunk)
+);
 
-assert.equal(acceptReceiverChunk(state, hello.chunks[0]).kind, "waiting");
-applyReceiverManifest(state, hello.manifest);
-assert.equal(receiverTotalCount(state), 100);
-assert.equal(receiverMissingCount(state), 100);
-assert.equal(receiverMissingRangeSummary(state), "1-100");
-assert.equal(acceptReceiverTransfer(state, "").ok, true);
+// --- manual accept ---------------------------------------------------------
+const manual = createReceiverSession({ autoAccept: false });
+assert.equal(manual.status, "idle");
+const seen = ingestText(manual, transfer.manifestText);
+assert.equal(seen.type, "manifest");
+assert.equal(seen.applied, true);
+assert.equal(seen.awaitingAccept, true);
+assert.equal(manual.status, "awaiting-accept");
+assert.equal(getProgress(manual).dataTotal, transfer.manifest.payload.chunkCount);
 
-const wrongTransfer = { ...hello.chunks[0], transferId: "wrong-transfer" };
-assert.equal(acceptReceiverChunk(state, wrongTransfer).kind, "wrong-id");
-assert.equal(state.chunks.size, 0);
+const beforeAccept = ingestText(manual, dataFrames[0]);
+assert.equal(beforeAccept.accepted, false);
+assert.equal(beforeAccept.reason, "not-receiving");
+assert.equal(manual.data.size, 0);
 
-assert.equal(acceptReceiverChunk(state, hello.chunks[0]).kind, "accepted");
-assert.equal(acceptReceiverChunk(state, hello.chunks[0]).kind, "duplicate");
-assert.equal(state.chunks.size, 1);
-assert.equal(receiverMissingRangeSummary(state), "2-100");
+assert.equal(acceptTransfer(manual), true);
+assert.equal(manual.status, "receiving");
+assert.equal(ingestText(manual, dataFrames[0]).accepted, true);
 
-assert.equal(acceptReceiverChunk(state, hello.chunks[9]).kind, "accepted");
-assert.equal(receiverMissingRangeSummary(state), "2-9, 11-100");
+// --- auto accept -----------------------------------------------------------
+const auto = createReceiverSession();
+ingestText(auto, transfer.manifestText);
+assert.equal(auto.status, "receiving");
 
-for (const chunk of hello.chunks.slice(1)) {
-  if (chunk.seq === 9) {
+for (const frame of dataFrames.slice(0, 10)) {
+  ingestText(auto, frame);
+}
+const partial = getProgress(auto);
+assert.equal(partial.dataReceived, 10);
+assert.ok(partial.ratio > 0 && partial.ratio < 1);
+assert.equal(missingRanges(auto).startsWith("11"), true);
+
+// Chunks for another transfer are ignored without touching progress.
+const foreign = ingestText(auto, encodeChunkFrame("zzzz", "data", 11, new Uint8Array([1])));
+assert.equal(foreign.type, "foreign");
+assert.equal(auto.data.size, 10);
+
+// A second manifest while this transfer has progress must not wipe it.
+const other = await buildTransfer(
+  { name: "other.bin", mime: "application/octet-stream", bytes: new Uint8Array([1, 2, 3]) },
+  { chunkSize: 64, repairRatio: 0.1, compression: "none" }
+);
+const pending = ingestText(auto, other.manifestText);
+assert.equal(pending.type, "manifest");
+assert.equal(pending.pending, true);
+assert.equal(auto.data.size, 10);
+assert.ok(auto.pendingManifest);
+
+discardPendingManifest(auto);
+assert.equal(auto.pendingManifest, null);
+assert.equal(auto.data.size, 10);
+
+ingestText(auto, other.manifestText);
+assert.equal(switchToPendingManifest(auto), true);
+assert.equal(auto.manifest.file.name, "other.bin");
+assert.equal(auto.data.size, 0);
+assert.equal(switchToPendingManifest(auto), false);
+
+// --- repair based completion ----------------------------------------------
+const repairing = createReceiverSession();
+ingestText(repairing, transfer.manifestText);
+const dropCount = 4;
+for (let seq = 0; seq < transfer.data.length; seq += 1) {
+  if (seq < dropCount) {
     continue;
   }
-  assert.equal(acceptReceiverChunk(state, chunk).kind, "accepted");
+  ingestText(repairing, dataFrames[seq]);
 }
+assert.equal(getProgress(repairing).missing, dropCount);
+assert.equal(getProgress(repairing).complete, false);
+assert.equal((await restoreTransfer(repairing, "")).ok, false);
 
-assert.equal(receiverMissingCount(state), 0);
-assert.equal(receiverMissingRangeSummary(state), "none");
-const complete = await completeReceiverTransfer(hello.manifest, state.chunks, "");
-assert.equal(complete.ok, true);
-assert.equal(complete.hashStatus, "valid");
-assert.equal(new TextDecoder().decode(complete.bytes), new TextDecoder().decode(hello.bytes));
+for (const frame of repairFrames) {
+  ingestText(repairing, frame);
+}
+const solve = trySolve(repairing, 10_000);
+assert.equal(solve.attempted, true);
+assert.equal(solve.solved, dropCount);
+const solvedProgress = getProgress(repairing);
+assert.equal(solvedProgress.complete, true);
+assert.equal(solvedProgress.recovered, dropCount);
 
-const encrypted = await buildByteTransfer({
-  name: "secret.txt",
-  mime: "text/plain",
-  bytes: new TextEncoder().encode("secret"),
-  chunkSize: 10,
-  fps: 5,
-  loop: true,
-  compression: "gzip",
-  passphrase: "secret phrase"
+const restored = await restoreTransfer(repairing, "");
+assert.equal(restored.ok, true);
+assert.equal(restored.hashStatus, "valid");
+
+// --- a repaired *last* chunk must not overflow the payload assembly ---------
+// The last data chunk is shorter than chunkSize; a chunk rebuilt from repair
+// frames is padded to chunkSize. Assembly has to trim it back.
+const tailBytes = new TextEncoder().encode("x".repeat(100));
+const tail = await buildTransfer(
+  { name: "tail.bin", mime: "application/octet-stream", bytes: tailBytes },
+  { chunkSize: 64, repairRatio: 0.5, compression: "none", transferId: "tail" }
+);
+assert.equal(tail.manifest.payload.chunkCount, 2);
+assert.equal(tail.manifest.payload.size, 100);
+
+const tailSession = createReceiverSession();
+ingestText(tailSession, tail.manifestText);
+ingestText(tailSession, encodeChunkFrame(tail.manifest.transferId, "data", 0, tail.data[0]));
+for (const [seq, chunk] of tail.repairs.entries()) {
+  ingestText(tailSession, encodeChunkFrame(tail.manifest.transferId, "repair", seq, chunk));
+}
+assert.equal(getProgress(tailSession).complete, false);
+trySolve(tailSession, 20_000);
+assert.equal(getProgress(tailSession).complete, true, "repair should rebuild the short tail chunk");
+assert.equal(getProgress(tailSession).recovered, 1);
+
+const tailRestore = await restoreTransfer(tailSession, "");
+assert.equal(tailRestore.ok, true);
+assert.equal(tailRestore.bytes.byteLength, 100);
+assert.equal(new TextDecoder().decode(tailRestore.bytes), "x".repeat(100));
+
+// --- encrypted retry -------------------------------------------------------
+const encrypted = await buildTransfer(
+  { name: "locked.txt", mime: "text/plain", bytes },
+  { chunkSize: 80, repairRatio: 0.1, compression: "gzip", passphrase: "open sesame" }
+);
+assert.equal(encrypted.manifest.payload.encryption, "AES-GCM");
+const locked = createReceiverSession();
+ingestText(locked, encrypted.manifestText);
+encrypted.data.forEach((chunk, seq) => {
+  ingestText(locked, encodeChunkFrame(encrypted.manifest.transferId, "data", seq, chunk));
 });
-const encryptedState = createReceiverTransferState();
-applyReceiverManifest(encryptedState, encrypted.manifest);
-assert.equal(acceptReceiverTransfer(encryptedState, "").ok, false);
-assert.equal(acceptReceiverTransfer(encryptedState, "secret phrase").ok, true);
-for (const chunk of encrypted.chunks) {
-  acceptReceiverChunk(encryptedState, chunk);
-}
-assert.equal((await completeReceiverTransfer(encrypted.manifest, encryptedState.chunks, "wrong phrase")).ok, false);
-assert.equal((await completeReceiverTransfer(encrypted.manifest, encryptedState.chunks, "wrong phrase")).hashStatus, "invalid");
+assert.equal(getProgress(locked).complete, true);
 
-applyReceiverManifest(encryptedState, encrypted.manifest);
-acceptReceiverTransfer(encryptedState, "secret phrase");
-for (const chunk of encrypted.chunks) {
-  acceptReceiverChunk(encryptedState, chunk);
-}
-const encryptedComplete = await completeReceiverTransfer(encrypted.manifest, encryptedState.chunks, "secret phrase");
-assert.equal(encryptedComplete.ok, true);
-assert.equal(new TextDecoder().decode(encryptedComplete.bytes), "secret");
+const denied = await restoreTransfer(locked, "");
+assert.equal(denied.ok, false);
+assert.equal(locked.status, "error");
+assert.ok(denied.message.includes("passphrase"));
+
+const deniedAgain = await restoreTransfer(locked, "guess");
+assert.equal(deniedAgain.ok, false);
+
+const unlocked = await restoreTransfer(locked, "open sesame");
+assert.equal(unlocked.ok, true);
+assert.equal(locked.status, "complete");
+assert.equal(locked.hashStatus, "valid");
+
+// --- reset -----------------------------------------------------------------
+resetReceiverSession(locked);
+assert.equal(locked.status, "idle");
+assert.equal(locked.manifest, null);
+assert.equal(locked.data.size, 0);
+assert.equal(getProgress(locked).dataTotal, 0);
+
+// applyManifest is usable directly by the UI.
+applyManifest(auto, transfer.manifest);
+assert.equal(auto.manifest?.transferId, transfer.manifest.transferId);
 
 console.log("receiver-smoke ok");

@@ -1,3 +1,8 @@
+> **実装メモ (v0.2):** この文書は初期要件定義です。現在の実装は QROPT/2 プロトコル
+> （コンパクトなチャンクフレーム + CRC-32 + XOR リペアチャンク + マニフェストビーコン）を
+> 採用しており、詳細は [`docs/protocol.md`](protocol.md) と
+> [`docs/design-notes.md`](design-notes.md) を参照してください。
+
 # QR Optical Transfer Web 要件定義 v0.1
 
 ## 1. 目的
