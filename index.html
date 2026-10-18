@@ -3,13 +3,19 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <meta name="theme-color" content="#1f2b24" />
+    <meta name="theme-color" content="#0d1210" />
+    <meta
+      name="description"
+      content="Transfer files between two devices with nothing but a screen and a camera: looping QR codes, XOR repair frames, SHA-256 verification."
+    />
     <link rel="manifest" href="/manifest.webmanifest" />
     <link rel="icon" href="/icon.svg" type="image/svg+xml" />
+    <link rel="apple-touch-icon" href="/icon.svg" />
     <title>QR Optical Transfer</title>
   </head>
   <body>
     <main id="app"></main>
+    <noscript>QR Optical Transfer needs JavaScript to encode and decode QR frames.</noscript>
     <script type="module" src="/src/main.ts"></script>
   </body>
 </html>
